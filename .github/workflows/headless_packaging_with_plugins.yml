@@ -1,124 +1,138 @@
-name: Build FUXA Headless + Offline Plugins
+name: Build FUXA Headless - Windows x64 Offline
 
 on:
   workflow_dispatch:
 
-# These are the additional SERVER-SIDE FUXA plugins that will be baked into
-# the portable headless executable.
-#
-# FUXA master currently expects:
-#   modbus-serial        8.0.19
-#   chart.js             2.9.4
-#   chartjs-node-canvas  3.2.0
-#
-# IMPORTANT:
-# - The Angular/HMI client already has its own Chart.js dependency.
-# - chart.js + chartjs-node-canvas below are for FUXA server-side report charts.
-# - Add additional FUXA plugin packages here, one per line, using pinned versions.
-env:
-  EXTRA_FUXA_PLUGINS: >-
-    modbus-serial@8.0.19
-    chart.js@2.9.4
-    chartjs-node-canvas@3.2.0
-
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
+  build-windows-x64:
+    runs-on: windows-2022
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            arch: x64
-          
     steps:
-      - name: Checkout code
+      - name: Checkout FUXA
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            server/package-lock.json
+            client/package-lock.json
 
-      # FUXA already needs build-essential/unixODBC on Linux.
-      # The Cairo/Pango packages additionally allow chartjs-node-canvas/node-canvas
-      # to build from source on runners where a prebuilt native binary is unavailable
-      # (notably some ARM64 combinations).
-      - name: Install Linux build dependencies
-        if: startsWith(matrix.os, 'ubuntu')
+      - name: Show build environment
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            pkg-config \
-            unixodbc \
-            unixodbc-dev \
-            libcairo2-dev \
-            libpango1.0-dev \
-            libjpeg-dev \
-            libgif-dev \
-            librsvg2-dev
+          Write-Host "Windows:"
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
+          Write-Host ""
+          Write-Host "Node:"
+          node --version
+          Write-Host "npm:"
+          npm --version
+          Write-Host ""
+          Write-Host "FUXA commit:"
+          git rev-parse HEAD
 
       - name: Install server dependencies
+        working-directory: ./server
+        shell: pwsh
         run: |
-          npm config set fetch-retry-maxtimeout 120000
           npm config set fetch-retries 5
-          npm install --prefer-offline --no-audit
-        working-directory: ./server
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
 
-      # This is the important addition.
-      # Installing here puts the packages in server/node_modules before the complete
-      # server tree is copied into the headless package.
-      - name: Install offline FUXA plugins
-        run: |
-          echo "Installing additional FUXA plugins:"
-          echo "${EXTRA_FUXA_PLUGINS}"
-          npm install \
-            --no-save \
-            --package-lock=false \
-            --prefer-offline \
-            --no-audit \
-            ${EXTRA_FUXA_PLUGINS}
-        working-directory: ./server
+          $attempt = 1
+          $maxAttempts = 2
 
-      # Fail the build now if one of the requested packages cannot actually load.
-      - name: Verify bundled plugins
-        run: |
-          node -e "
-            require('modbus-serial');
-            require('chart.js');
-            require('chartjs-node-canvas');
-            console.log('Verified: modbus-serial, chart.js, chartjs-node-canvas');
-          "
+          while ($attempt -le $maxAttempts) {
+            Write-Host "Server dependency install attempt $attempt of $maxAttempts..."
+            npm install --prefer-offline --no-audit
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Server dependencies installed successfully."
+              break
+            }
+
+            if ($attempt -eq $maxAttempts) {
+              throw "Server dependency installation failed after $maxAttempts attempts."
+            }
+
+            Write-Warning "npm install failed. Waiting 20 seconds before retry..."
+            Start-Sleep -Seconds 20
+            $attempt++
+          }
+
+      - name: Install Modbus plugin for offline use
         working-directory: ./server
+        shell: pwsh
+        run: |
+          npm install --no-save --package-lock=false --prefer-offline --no-audit modbus-serial@8.0.19
+          if ($LASTEXITCODE -ne 0) {
+            throw "modbus-serial installation failed."
+          }
+
+      - name: Verify server native modules and Modbus
+        working-directory: ./server
+        shell: pwsh
+        run: |
+          node -e "require('sqlite3'); console.log('sqlite3 OK')"
+          if ($LASTEXITCODE -ne 0) { throw "sqlite3 failed to load." }
+
+          node -e "require('modbus-serial'); console.log('modbus-serial OK')"
+          if ($LASTEXITCODE -ne 0) { throw "modbus-serial failed to load." }
 
       - name: Install client dependencies
+        working-directory: ./client
+        shell: pwsh
         run: |
-          npm config set fetch-retry-maxtimeout 120000
           npm config set fetch-retries 5
-          npm install --prefer-offline --no-audit
-        working-directory: ./client
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
 
-      - name: Build client
-        run: npm run build -- --configuration=production
-        working-directory: ./client
+          $attempt = 1
+          $maxAttempts = 2
 
-      - name: Setup Headless Package Directory
+          while ($attempt -le $maxAttempts) {
+            Write-Host "Client dependency install attempt $attempt of $maxAttempts..."
+            npm install --prefer-offline --no-audit
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Client dependencies installed successfully."
+              break
+            }
+
+            if ($attempt -eq $maxAttempts) {
+              throw "Client dependency installation failed after $maxAttempts attempts."
+            }
+
+            Write-Warning "npm install failed. Waiting 20 seconds before retry..."
+            Start-Sleep -Seconds 20
+            $attempt++
+          }
+
+      - name: Build FUXA web client
+        working-directory: ./client
+        shell: pwsh
         run: |
+          npm run build -- --configuration=production
+          if ($LASTEXITCODE -ne 0) {
+            throw "FUXA client build failed."
+          }
+
+      - name: Assemble headless package tree
+        shell: bash
+        run: |
+          set -e
           mkdir -p fuxa-headless/server
           mkdir -p fuxa-headless/client/dist
 
-          # Copy the complete server tree INCLUDING node_modules and the plugins
-          # installed above, then copy the built Angular client.
           cp -r server/. fuxa-headless/server/
           cp -r client/dist/. fuxa-headless/client/dist/
-
-          # Use FUXA's headless entry point as the pkg main file.
           cp app/headless/headless-entry.js fuxa-headless/main.js
-        shell: bash
 
-      - name: Create Package Config
+      - name: Create pkg configuration
+        shell: bash
         run: |
           cat > fuxa-headless/package.json <<'EOF'
           {
@@ -135,59 +149,84 @@ jobs:
             }
           }
           EOF
-        shell: bash
 
       - name: Install yao-pkg
-        run: npm install -g @yao-pkg/pkg
-
-      - name: Build Standalone Binaries (Headless)
+        shell: pwsh
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            if [ "${{ matrix.arch }}" = "arm64" ]; then
-              TARGET="node20-linux-arm64"
-            else
-              TARGET="node20-linux-x64"
-            fi
-          elif [ "$RUNNER_OS" = "Windows" ]; then
-            TARGET="node20-win-x64"
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            if [ "${{ matrix.arch }}" = "arm64" ]; then
-              TARGET="node20-macos-arm64"
-            else
-              TARGET="node20-macos-x64"
-            fi
-          fi
+          npm install -g @yao-pkg/pkg
+          if ($LASTEXITCODE -ne 0) {
+            throw "@yao-pkg/pkg installation failed."
+          }
 
-          echo "Packaging target: $TARGET"
-          pkg fuxa-headless/package.json --targets "$TARGET" --out-path artifacts
+      - name: Build Windows x64 standalone executable
         shell: bash
-        working-directory: .
-
-      - name: Prepare artifacts
         run: |
-          if [ "${{ matrix.os }}" = "windows-latest" ] && [ "${{ matrix.arch }}" = "x64" ]; then
-            mv artifacts/fuxa-headless-win-x64.exe artifacts/FUXA-headless-windows-x64.exe || true
-          elif [ "${{ matrix.os }}" = "ubuntu-latest" ] && [ "${{ matrix.arch }}" = "x64" ]; then
-            mv artifacts/fuxa-headless-linux-x64 artifacts/FUXA-headless-linux-x64 || true
-          elif [ "${{ matrix.os }}" = "ubuntu-24.04-arm" ] && [ "${{ matrix.arch }}" = "arm64" ]; then
-            mv artifacts/fuxa-headless-linux-arm64 artifacts/FUXA-headless-linux-arm64 || true
-          elif [ "${{ matrix.os }}" = "macos-latest" ] && [ "${{ matrix.arch }}" = "x64" ]; then
-            mv artifacts/fuxa-headless-macos-x64 artifacts/FUXA-headless-macos-x64 || true
-          elif [ "${{ matrix.os }}" = "macos-latest" ]; then
-            mv artifacts/fuxa-headless-macos-arm64 artifacts/FUXA-headless-macos-arm64 || true
-          fi
+          set -e
+          mkdir -p artifacts
 
-          cat > artifacts/BUNDLED-PLUGINS.txt <<EOF
-          FUXA headless custom build
-          Node runtime: 20
+          pkg fuxa-headless/package.json \
+            --targets node20-win-x64 \
+            --out-path artifacts
 
-          Additional server-side plugins:
-          ${EXTRA_FUXA_PLUGINS}
-          EOF
-        shell: bash
+          mv artifacts/fuxa-headless-win-x64.exe \
+             artifacts/FUXA-headless-windows-x64.exe
 
-      - name: Upload artifact
+      - name: Create build manifest and SHA-256
+        shell: pwsh
+        run: |
+          $exe = "artifacts/FUXA-headless-windows-x64.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Expected executable was not created: $exe"
+          }
+
+          $fuxaCommit = (git rev-parse HEAD).Trim()
+          $nodeVersion = (node --version).Trim()
+          $npmVersion = (npm --version).Trim()
+          $modbusVersion = (node -p "require('./server/node_modules/modbus-serial/package.json').version").Trim()
+          $sqliteVersion = (node -p "require('./server/node_modules/sqlite3/package.json').version").Trim()
+          $buildUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+
+          @"
+          FUXA custom headless build
+          ==========================
+
+          Runtime target: Windows x64
+          Intended deployment: Windows 11 25H2 x64
+          pkg target: node20-win-x64
+
+          FUXA commit: $fuxaCommit
+          Build UTC: $buildUtc
+          Build Node: $nodeVersion
+          Build npm: $npmVersion
+
+          Baked-in additional plugin:
+            modbus-serial: $modbusVersion
+
+          Verified native dependency:
+            sqlite3: $sqliteVersion
+
+          Notes:
+            - FUXA's normal Angular client assets are included.
+            - Client-side Chart.js is included by the normal FUXA client build.
+            - No Internet/npm installation should be required for Modbus at runtime.
+          "@ | Set-Content -Encoding UTF8 artifacts/BUILD-MANIFEST.txt
+
+          "$hash  FUXA-headless-windows-x64.exe" |
+            Set-Content -Encoding ASCII artifacts/SHA256.txt
+
+          Write-Host ""
+          Write-Host "Build complete."
+          Write-Host "SHA-256: $hash"
+          Write-Host ""
+          Get-ChildItem artifacts
+
+      - name: Upload Windows x64 build
         uses: actions/upload-artifact@v4
         with:
-          name: FUXA-headless-${{ matrix.os }}-${{ matrix.arch }}
-          path: artifacts/*
+          name: FUXA-headless-windows-x64-offline
+          path: |
+            artifacts/FUXA-headless-windows-x64.exe
+            artifacts/BUILD-MANIFEST.txt
+            artifacts/SHA256.txt
+          if-no-files-found: error
