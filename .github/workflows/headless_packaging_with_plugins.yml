@@ -166,10 +166,10 @@ jobs:
 
           pkg fuxa-headless/package.json \
             --targets node20-win-x64 \
-            --out-path artifacts
+            --output artifacts/FUXA-headless-windows-x64.exe
 
-          mv artifacts/fuxa-headless-win-x64.exe \
-             artifacts/FUXA-headless-windows-x64.exe
+          echo "Created:"
+          ls -lh artifacts/
 
       - name: Create build manifest and SHA-256
         shell: pwsh
