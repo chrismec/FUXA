@@ -1,0 +1,5 @@
+env:
+  EXTRA_FUXA_PLUGINS: >-
+    modbus-serial@8.0.19
+    chart.js@2.9.4
+    chartjs-node-canvas@3.2.0
