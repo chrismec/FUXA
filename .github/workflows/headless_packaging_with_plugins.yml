@@ -2,19 +2,41 @@ name: Build FUXA Headless - Windows x64 Offline
 
 on:
   workflow_dispatch:
+    inputs:
+      fuxa_ref:
+        description: 'FUXA version to build from frangoteam/FUXA: a tag (e.g. v1.3.6), a branch (master) or a commit SHA'
+        required: true
+        default: 'master'
+
+env:
+  # Node.js major version. Used for the build AND packaged into the exe, so they always match.
+  # 22 = what FUXA itself targets since upstream PR #2662 (2026-10-29). Node 22 is supported until 2027-04-30.
+  NODE_MAJOR: '22'
+  # The modbus-serial version FUXA's own plugin manager installs (server/runtime/plugins/index.js).
+  MODBUS_SERIAL_VERSION: '8.0.19'
+  # Packager, pinned so a rebuild is repeatable. pkg 6.25.0 ships pkg-fetch 3.6.7 (Node 22.23.4).
+  # pkg-fetch 3.6.8 only adds newer Node binaries; it is forced here to get Node 22.23.5 (security release 2026-11-11).
+  # Once a pkg release includes pkg-fetch >= 3.6.8, set PKG_VERSION to it and PKG_FETCH_VERSION to match.
+  PKG_VERSION: '6.25.0'
+  PKG_FETCH_VERSION: '3.6.8'
+  # Where pkg downloads its Node.js binary. Kept in the workspace so the manifest can record which one it used.
+  PKG_CACHE_PATH: ${{ github.workspace }}/.pkg-cache
 
 jobs:
   build-windows-x64:
     runs-on: windows-2022
 
     steps:
-      - name: Checkout FUXA
+      - name: Checkout FUXA (upstream frangoteam/FUXA)
         uses: actions/checkout@v4
+        with:
+          repository: frangoteam/FUXA
+          ref: ${{ inputs.fuxa_ref }}
 
-      - name: Setup Node.js 20
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_MAJOR }}
           cache: 'npm'
           cache-dependency-path: |
             server/package-lock.json
@@ -33,6 +55,8 @@ jobs:
           Write-Host ""
           Write-Host "FUXA commit:"
           git rev-parse HEAD
+          Write-Host "FUXA version:"
+          node -p "require('./server/package.json').version"
 
       - name: Install server dependencies
         working-directory: ./server
@@ -67,7 +91,7 @@ jobs:
         working-directory: ./server
         shell: pwsh
         run: |
-          npm install --no-save --package-lock=false --prefer-offline --no-audit modbus-serial@8.0.19
+          npm install --no-save --package-lock=false --prefer-offline --no-audit "modbus-serial@$env:MODBUS_SERIAL_VERSION"
           if ($LASTEXITCODE -ne 0) {
             throw "modbus-serial installation failed."
           }
@@ -150,13 +174,31 @@ jobs:
           }
           EOF
 
-      - name: Install yao-pkg
+      - name: Install yao-pkg (pinned)
         shell: pwsh
         run: |
-          npm install -g @yao-pkg/pkg
+          New-Item -ItemType Directory -Force pkg-tool | Out-Null
+          @{
+            name = 'pkg-tool'
+            private = $true
+            dependencies = @{ '@yao-pkg/pkg' = $env:PKG_VERSION }
+            overrides = @{ '@yao-pkg/pkg-fetch' = $env:PKG_FETCH_VERSION }
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 pkg-tool/package.json
+
+          npm install --prefix pkg-tool --no-audit --no-fund
           if ($LASTEXITCODE -ne 0) {
             throw "@yao-pkg/pkg installation failed."
           }
+
+          $fetchPkg = 'pkg-tool/node_modules/@yao-pkg/pkg-fetch/package.json'
+          if (-not (Test-Path $fetchPkg)) {
+            $fetchPkg = 'pkg-tool/node_modules/@yao-pkg/pkg/node_modules/@yao-pkg/pkg-fetch/package.json'
+          }
+          $fetchVersion = (Get-Content $fetchPkg -Raw | ConvertFrom-Json).version
+          if ($fetchVersion -ne $env:PKG_FETCH_VERSION) {
+            throw "pkg-fetch is $fetchVersion, expected $env:PKG_FETCH_VERSION"
+          }
+          Write-Host "pkg-fetch $fetchVersion OK"
 
       - name: Build Windows x64 standalone executable
         shell: bash
@@ -164,8 +206,8 @@ jobs:
           set -e
           mkdir -p artifacts
 
-          pkg fuxa-headless/package.json \
-            --targets node20-win-x64 \
+          ./pkg-tool/node_modules/.bin/pkg fuxa-headless/package.json \
+            --targets "node${NODE_MAJOR}-win-x64" \
             --output artifacts/FUXA-headless-windows-x64.exe
 
           echo "Created:"
@@ -173,6 +215,8 @@ jobs:
 
       - name: Create build manifest and SHA-256
         shell: pwsh
+        env:
+          FUXA_REF: ${{ inputs.fuxa_ref }}
         run: |
           $exe = "artifacts/FUXA-headless-windows-x64.exe"
           if (-not (Test-Path $exe)) {
@@ -180,12 +224,24 @@ jobs:
           }
 
           $fuxaCommit = (git rev-parse HEAD).Trim()
+          $fuxaVersion = (node -p "require('./server/package.json').version").Trim()
           $nodeVersion = (node --version).Trim()
           $npmVersion = (npm --version).Trim()
           $modbusVersion = (node -p "require('./server/node_modules/modbus-serial/package.json').version").Trim()
           $sqliteVersion = (node -p "require('./server/node_modules/sqlite3/package.json').version").Trim()
+          $pkgVersion = (Get-Content pkg-tool/node_modules/@yao-pkg/pkg/package.json -Raw | ConvertFrom-Json).version
           $buildUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
           $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+
+          # The Node.js binary pkg packed into the exe (pkg names it fetched-<version>-win-x64).
+          $fetched = @(Get-ChildItem -Path $env:PKG_CACHE_PATH -Recurse -File -ErrorAction SilentlyContinue |
+            ForEach-Object { if ($_.Name -match '^fetched-(v\d+\.\d+\.\d+)-win-x64$') { $Matches[1] } })
+          if ($fetched.Count -eq 0) {
+            $packagedNode = "unknown (see the pkg step log)"
+            Write-Warning "Could not find the packaged Node.js binary in $env:PKG_CACHE_PATH"
+          } else {
+            $packagedNode = $fetched -join ', '
+          }
 
           @"
           FUXA custom headless build
@@ -193,12 +249,16 @@ jobs:
 
           Runtime target: Windows x64
           Intended deployment: Windows 11 25H2 x64
-          pkg target: node20-win-x64
+          pkg target: node$($env:NODE_MAJOR)-win-x64
+          Packaged Node.js runtime: $packagedNode
 
+          FUXA source: frangoteam/FUXA, requested ref: $($env:FUXA_REF)
           FUXA commit: $fuxaCommit
+          FUXA version: $fuxaVersion
           Build UTC: $buildUtc
           Build Node: $nodeVersion
           Build npm: $npmVersion
+          Packager: @yao-pkg/pkg $pkgVersion, @yao-pkg/pkg-fetch $($env:PKG_FETCH_VERSION)
 
           Baked-in additional plugin:
             modbus-serial: $modbusVersion
@@ -219,6 +279,7 @@ jobs:
           Write-Host "Build complete."
           Write-Host "SHA-256: $hash"
           Write-Host ""
+          Get-Content artifacts/BUILD-MANIFEST.txt
           Get-ChildItem artifacts
 
       - name: Upload Windows x64 build
