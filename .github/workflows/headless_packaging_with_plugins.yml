@@ -21,6 +21,8 @@ env:
   PKG_FETCH_VERSION: '3.6.8'
   # Where pkg downloads its Node.js binary. Kept in the workspace so the manifest can record which one it used.
   PKG_CACHE_PATH: ${{ github.workspace }}/.pkg-cache
+  # The actions below (checkout, setup-node, upload-artifact) are @v7, which run on Node 24.
+  # @v4 ran on Node 20 and made GitHub show a "Node.js 20 is deprecated" warning.
 
 jobs:
   build-windows-x64:
@@ -28,13 +30,13 @@ jobs:
 
     steps:
       - name: Checkout FUXA (upstream frangoteam/FUXA)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: frangoteam/FUXA
           ref: ${{ inputs.fuxa_ref }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_MAJOR }}
           cache: 'npm'
@@ -177,17 +179,24 @@ jobs:
       - name: Install yao-pkg (pinned)
         shell: pwsh
         run: |
+          # Run npm from inside pkg-tool. On the Windows runner, npm ignored --prefix and looked for
+          # package.json in the repo root instead (first run of this workflow, 2026-11-17).
           New-Item -ItemType Directory -Force pkg-tool | Out-Null
-          @{
-            name = 'pkg-tool'
-            private = $true
-            dependencies = @{ '@yao-pkg/pkg' = $env:PKG_VERSION }
-            overrides = @{ '@yao-pkg/pkg-fetch' = $env:PKG_FETCH_VERSION }
-          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 pkg-tool/package.json
+          Push-Location pkg-tool
+          try {
+            @{
+              name = 'pkg-tool'
+              private = $true
+              dependencies = @{ '@yao-pkg/pkg' = $env:PKG_VERSION }
+              overrides = @{ '@yao-pkg/pkg-fetch' = $env:PKG_FETCH_VERSION }
+            } | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 package.json
 
-          npm install --prefix pkg-tool --no-audit --no-fund
-          if ($LASTEXITCODE -ne 0) {
-            throw "@yao-pkg/pkg installation failed."
+            npm install --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) {
+              throw "@yao-pkg/pkg installation failed."
+            }
+          } finally {
+            Pop-Location
           }
 
           $fetchPkg = 'pkg-tool/node_modules/@yao-pkg/pkg-fetch/package.json'
@@ -206,7 +215,8 @@ jobs:
           set -e
           mkdir -p artifacts
 
-          ./pkg-tool/node_modules/.bin/pkg fuxa-headless/package.json \
+          # Call pkg's entry script with node directly, so no npm .bin wrapper is involved on Windows.
+          node pkg-tool/node_modules/@yao-pkg/pkg/lib-es5/bin.js fuxa-headless/package.json \
             --targets "node${NODE_MAJOR}-win-x64" \
             --output artifacts/FUXA-headless-windows-x64.exe
 
@@ -283,7 +293,7 @@ jobs:
           Get-ChildItem artifacts
 
       - name: Upload Windows x64 build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: FUXA-headless-windows-x64-offline
           path: |
